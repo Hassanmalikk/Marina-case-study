@@ -1,0 +1,84 @@
+version: 2
+
+sources:
+  - name: marina_pms
+    description: >
+      Legacy Marina Property Management System extract (bookings, customers, boats).
+      Lands in the `raw` schema (all VARCHAR). Locally loaded from data/raw/*.csv by the
+      load_local_raw_sources on-run-start hook; in production loaded by the EL tool.
+    schema: raw
+    meta:
+      owner: marina-operations
+      local_csv_dir: data/raw
+    tables:
+      - name: raw_marina_pms
+        description: One row per slip booking as exported by the PMS.
+        data_tests:
+          - expected_columns:
+              arguments:
+                column_names: [booking_id, customer_full_name, raw_contact, boat_name, hull_id, slip_fee, marina_code]
+        columns:
+          - name: booking_id
+            data_tests: [not_null, unique]
+          - name: customer_full_name
+            meta: {contains_pii: true, pii_type: name}
+          - name: raw_contact
+            meta: {contains_pii: true, pii_type: email_or_phone}
+
+models:
+  - name: stg_marina_pms
+    description: Cleaned, typed PMS bookings. Contact info parsed into canonical email / E.164 phone.
+    columns:
+      - name: booking_id
+        description: PMS booking identifier (primary key).
+        data_tests: [not_null, unique]
+      - name: booking_sequence
+        description: Numeric part of booking_id; recency proxy (PMS ids are sequential, no booking date exists).
+        data_tests: [not_null]
+      - name: customer_full_name
+        description: Customer name as typed in the PMS (trimmed only; matching keys are derived downstream).
+        meta: {contains_pii: true, pii_type: name}
+      - name: contact_email
+        description: Lower-cased email extracted from raw_contact; NULL if raw_contact held no email.
+        meta: {contains_pii: true, pii_type: email}
+      - name: contact_phone_e164
+        description: Phone in E.164 format (e.g. +15550192834); NULL if raw_contact held no valid phone.
+        meta: {contains_pii: true, pii_type: phone}
+      - name: contact_type
+        description: Which contact point raw_contact contained. 'unparseable' rows cannot be identity-matched.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [email, phone]
+              config:
+                severity: warn   # an unparseable contact degrades matching but must not block revenue KPIs
+      - name: hull_id
+        description: Standardised hull identifier (upper-case alphanumerics only). Natural key for boats.
+        data_tests: [not_null]
+      - name: slip_fee_usd
+        description: Slip fee parsed from strings like "$1,200.00" into DECIMAL(10,2).
+        data_tests:
+          - not_null   # NULL here means the currency parser failed -> fail loudly
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+      - name: marina_code
+        data_tests: [not_null]
+
+unit_tests:
+  - name: ut_stg_marina_pms_parses_dirty_contact_and_currency
+    description: Currency strings, phone formats, email casing, hull formatting and junk values are canonicalised.
+    model: stg_marina_pms
+    given:
+      - input: source('marina_pms', 'raw_marina_pms')
+        rows:
+          - {booking_id: "BK-1", customer_full_name: " John Doe ", raw_contact: "+1 (555) 019-2834", boat_name: "Sea Breeze", hull_id: "fl-8812 ab", slip_fee: "$1,200.00", marina_code: "mia-01"}
+          - {booking_id: "BK-2", customer_full_name: "J. Doe", raw_contact: " JDoe_99@Gmail.com ", boat_name: "Seabreeze", hull_id: "FL-8812-AB", slip_fee: "1200", marina_code: "MIA-01"}
+          - {booking_id: "BK-3", customer_full_name: "Ann Lee", raw_contact: "555.019.2834", boat_name: "X", hull_id: "CA-1", slip_fee: "(150.50)", marina_code: "SAN-02"}
+          - {booking_id: "BK-10", customer_full_name: "No Contact", raw_contact: "N/A", boat_name: "Y", hull_id: "CA-2", slip_fee: "abc", marina_code: "SAN-02"}
+    expect:
+      rows:
+        - {booking_id: "BK-1", booking_sequence: 1, customer_full_name: "John Doe", contact_email: null, contact_phone_e164: "+15550192834", contact_type: phone, hull_id: "FL8812AB", slip_fee_usd: 1200.00, marina_code: "MIA-01"}
+        - {booking_id: "BK-2", booking_sequence: 2, customer_full_name: "J. Doe", contact_email: "jdoe_99@gmail.com", contact_phone_e164: null, contact_type: email, hull_id: "FL8812AB", slip_fee_usd: 1200.00, marina_code: "MIA-01"}
+        - {booking_id: "BK-3", booking_sequence: 3, customer_full_name: "Ann Lee", contact_email: null, contact_phone_e164: "+15550192834", contact_type: phone, hull_id: "CA1", slip_fee_usd: -150.50, marina_code: "SAN-02"}
+        - {booking_id: "BK-10", booking_sequence: 10, customer_full_name: "No Contact", contact_email: null, contact_phone_e164: null, contact_type: unparseable, hull_id: "CA2", slip_fee_usd: null, marina_code: "SAN-02"}

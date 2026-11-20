@@ -1,0 +1,53 @@
+name: marina_analytics
+version: "1.0.0"
+config-version: 2
+profile: marina_analytics
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+analysis-paths: ["analyses"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages", "logs"]
+
+# Local dev only: simulate the EL tool by landing raw CSVs as VARCHAR tables (no-op on non-DuckDB targets).
+on-run-start:
+  - "{{ load_local_raw_sources() }}"
+
+vars:
+  # Timezone that each source system writes naive (offset-less) timestamps in.
+  # Stripe's API emits UTC epochs. The vendor portal's timezone is UNCONFIRMED (assumption: UTC),
+  # so it is a variable: changing it is a config change, not a code change.
+  stripe_source_timezone: "UTC"
+  vendor_source_timezone: "UTC"
+  # Point-in-time for "current" KPIs (YYYY-MM-DD). null => today (UTC).
+  kpi_as_of_date: null
+  # Incremental re-processing window for mutable work orders (status/completed_at change after creation).
+  work_order_lookback_days: 30
+  # Identity resolution guard: a match key (email/phone/...) shared by more records than this is treated as a
+  # placeholder value and ignored, preventing runaway "mega-clusters" (and quadratic closure cost).
+  identity_max_records_per_key: 50
+
+models:
+  marina_analytics:
+    +persist_docs:
+      relation: true
+      columns: true
+    staging:
+      +schema: staging
+      +materialized: view
+    intermediate:
+      +schema: intermediate
+      +materialized: table
+    marts:
+      +schema: marts
+      +materialized: table
+
+seeds:
+  marina_analytics:
+    +schema: reference
+
+data_tests:
+  marina_analytics:
+    +store_failures: false

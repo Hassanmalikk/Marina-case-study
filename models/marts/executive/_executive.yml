@@ -1,0 +1,69 @@
+version: 2
+
+models:
+  - name: mrt_executive_kpis
+    description: >
+      Executive KPI tiles: one row per as-of date. Contract-enforced: the dashboard's schema cannot change
+      without a deliberate contract change (protects consumers from schema drift). PII-free.
+    config:
+      contract:
+        enforced: true
+    data_tests:
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "arr_usd = active_mrr_usd * 12"
+    columns:
+      - {name: as_of_date, data_type: date, description: Point in time the KPIs describe (var kpi_as_of_date; default today UTC)., constraints: [{type: not_null}], data_tests: [unique]}
+      - {name: active_subscriptions, data_type: bigint, description: Subscriptions whose latest event (as of date) is not churn.}
+      - {name: active_subscribers, data_type: bigint, description: Distinct resolved owners with >=1 active subscription.}
+      - {name: active_mrr_usd, data_type: "decimal(14,2)", description: "KPI 1: sum of current MRR over active subscriptions.", constraints: [{type: not_null}]}
+      - {name: arr_usd, data_type: "decimal(14,2)", description: "KPI 1: Annualised Recurring Revenue = active MRR x 12.", constraints: [{type: not_null}]}
+      - {name: logged_jobs, data_type: bigint, description: "All work orders created on or before the as-of date (KPI 2 denominator)."}
+      - {name: completed_jobs, data_type: bigint, description: "Completed work orders (KPI 3 population)."}
+      - {name: open_jobs, data_type: bigint, description: Work orders open or in progress.}
+      - {name: active_vendors, data_type: bigint, description: Distinct vendors/captains with at least one logged job.}
+      - {name: billable_hours, data_type: "decimal(14,2)", description: "Hours on completed work orders (KPI 2 numerator)."}
+      - {name: billable_hours_per_logged_job, data_type: "decimal(10,2)", description: "KPI 2: billable hours / logged jobs."}
+      - {name: avg_turnaround_hours, data_type: "decimal(10,2)", description: "KPI 3: mean(completed_at - created_at) in hours over completed jobs."}
+      - {name: total_owners, data_type: bigint, description: Unique owners after identity resolution.}
+      - {name: total_boats, data_type: bigint, description: Unique boats (by standardised hull id).}
+      - {name: kpis_generated_at_utc, data_type: timestamp, description: Build time (UTC); dashboard freshness indicator.}
+
+  - name: mrt_vendor_performance
+    description: Per vendor/captain utilisation and response time (drill-down behind the executive tiles). Contract-enforced.
+    config:
+      contract:
+        enforced: true
+    data_tests:
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "completed_jobs + open_jobs <= logged_jobs and billable_hours <= logged_hours"
+    columns:
+      - {name: as_of_date, data_type: date, constraints: [{type: not_null}]}
+      - {name: vendor_id, data_type: varchar, constraints: [{type: not_null}], data_tests: [unique]}
+      - {name: vendor_name, data_type: varchar, description: Most recently used spelling of the vendor name.}
+      - {name: vendor_type, data_type: varchar, description: captain | vendor}
+      - {name: logged_jobs, data_type: bigint}
+      - {name: completed_jobs, data_type: bigint}
+      - {name: open_jobs, data_type: bigint}
+      - {name: emergency_jobs, data_type: bigint}
+      - {name: logged_hours, data_type: "decimal(14,2)", description: Hours logged across all statuses.}
+      - {name: billable_hours, data_type: "decimal(14,2)", description: Hours on completed work orders.}
+      - {name: billable_hours_per_logged_job, data_type: "decimal(10,2)", description: "KPI 2 per vendor."}
+      - {name: total_turnaround_hours, data_type: "decimal(14,2)", description: Sum of turnaround (for correct re-aggregation).}
+      - {name: avg_turnaround_hours, data_type: "decimal(10,2)", description: "KPI 3 per vendor; NULL if no completed jobs."}
+      - {name: first_job_created_at_utc, data_type: timestamp}
+      - {name: last_job_created_at_utc, data_type: timestamp}
+
+exposures:
+  - name: executive_kpi_dashboard
+    label: Executive KPI Dashboard
+    type: dashboard
+    maturity: high
+    description: Leadership dashboard (MRR/ARR, vendor utilisation, response time). Lineage lets us run `dbt build -s +exposure:executive_kpi_dashboard`.
+    owner:
+      name: Analytics Engineering
+      email: analytics-engineering@example.com
+    depends_on:
+      - ref('mrt_executive_kpis')
+      - ref('mrt_vendor_performance')

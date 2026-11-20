@@ -1,0 +1,85 @@
+version: 2
+
+models:
+  - name: fct_work_orders
+    description: Work-order fact (incremental). One row per work order with billable hours and exact turnaround.
+    data_tests:
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "billable_hours <= logged_hours"
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "(is_completed and turnaround_seconds >= 0) or (not is_completed and turnaround_seconds is null)"
+          config:
+            description: Turnaround exists exactly for completed jobs and is never negative.
+    columns:
+      - name: work_order_id
+        data_tests: [not_null, unique]
+      - name: vendor_id
+        data_tests: [not_null]
+      - name: service_category
+        data_tests: [not_null]
+      - name: billable_hours
+        description: hours_spent for completed work orders, else 0.
+        data_tests: [not_null]
+      - name: created_date
+        description: Partition column (BigQuery) / natural clustering key for time-bounded queries.
+        data_tests: [not_null]
+      - name: turnaround_seconds
+        description: completed_at_utc - created_at_utc in seconds (completed only). Exact base unit for averages.
+
+  - name: fct_subscriptions
+    description: One row per subscription with its point-in-time state as of kpi_as_of_date.
+    columns:
+      - name: subscription_id
+        data_tests: [not_null, unique]
+      - name: owner_id
+        description: Resolved owner (pseudonymous key) via int_owner_identity_map.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('int_owners')
+                field: owner_id
+      - name: subscription_status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [active, churned]
+      - name: current_mrr_usd
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+
+unit_tests:
+  - name: ut_fct_subscriptions_point_in_time_mrr
+    description: >
+      As of 2026-06-30: the latest event wins (an upgrade changes MRR), churn zeroes MRR, subscriptions that start after
+      the as-of date are excluded, and a churn that happens after the as-of date is not yet applied.
+    model: fct_subscriptions
+    overrides:
+      vars:
+        kpi_as_of_date: "2026-06-30"
+    given:
+      - input: ref('stg_stripe_subscriptions')
+        rows:
+          - {subscription_event_id: a1, subscription_id: S1, plan_name: P, mrr_amount_usd: 100, event_type: new,     event_at_utc: "2026-01-01 00:00:00"}
+          - {subscription_event_id: a2, subscription_id: S1, plan_name: P, mrr_amount_usd: 150, event_type: upgrade, event_at_utc: "2026-03-01 00:00:00"}
+          - {subscription_event_id: b1, subscription_id: S2, plan_name: P, mrr_amount_usd: 100, event_type: new,     event_at_utc: "2026-01-01 00:00:00"}
+          - {subscription_event_id: b2, subscription_id: S2, plan_name: P, mrr_amount_usd: 100, event_type: churn,   event_at_utc: "2026-04-01 00:00:00"}
+          - {subscription_event_id: c1, subscription_id: S3, plan_name: P, mrr_amount_usd: 999, event_type: new,     event_at_utc: "2026-07-15 00:00:00"}
+          - {subscription_event_id: d1, subscription_id: S4, plan_name: P, mrr_amount_usd: 200, event_type: new,     event_at_utc: "2026-02-01 00:00:00"}
+          - {subscription_event_id: d2, subscription_id: S4, plan_name: P, mrr_amount_usd: 200, event_type: churn,   event_at_utc: "2026-07-01 00:00:00"}
+      - input: ref('int_owner_identity_map')
+        rows:
+          - {source_system: stripe, source_record_id: S1, owner_id: o1}
+          - {source_system: stripe, source_record_id: S2, owner_id: o2}
+          - {source_system: stripe, source_record_id: S3, owner_id: o3}
+          - {source_system: stripe, source_record_id: S4, owner_id: o4}
+    expect:
+      rows:
+        - {subscription_id: S1, owner_id: o1, last_event_type: upgrade, subscription_status: active,  current_mrr_usd: 150.00, event_count: 2}
+        - {subscription_id: S2, owner_id: o2, last_event_type: churn,   subscription_status: churned, current_mrr_usd: 0.00,   event_count: 2}
+        - {subscription_id: S4, owner_id: o4, last_event_type: new,     subscription_status: active,  current_mrr_usd: 200.00, event_count: 1}

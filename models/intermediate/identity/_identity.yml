@@ -1,0 +1,136 @@
+version: 2
+
+models:
+  - name: int_owner_identity_map
+    description: >
+      Identity crosswalk: one row per source customer record (PMS booking or Stripe subscription) mapped to its
+      resolved owner_id via graph-based entity resolution (email, E.164 phone, hull+surname+initial).
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [source_system, source_record_id]
+    columns:
+      - name: owner_id
+        description: Owner surrogate key = hash(anchor_record_key). Deterministic across runs.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('int_owners')
+                field: owner_id
+      - name: record_key
+        description: "'<source_system>:<source_record_id>' (primary key)."
+        data_tests: [not_null, unique]
+      - name: source_system
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [marina_pms, stripe]
+      - name: full_name
+        meta: {contains_pii: true, pii_type: name}
+      - name: email
+        meta: {contains_pii: true, pii_type: email}
+      - name: phone_e164
+        meta: {contains_pii: true, pii_type: phone}
+      - name: anchor_record_key
+        description: Smallest record_key in the connected component; the seed of owner_id.
+        data_tests: [not_null]
+      - name: matched_on
+        description: Comma list of identifier types that linked this record to another record, or 'unmatched'.
+        data_tests: [not_null]
+
+  - name: int_owners
+    description: Golden owner record (one row per owner_id) with deterministic survivorship rules.
+    columns:
+      - name: owner_id
+        data_tests: [not_null, unique]
+      - name: owner_full_name
+        meta: {contains_pii: true, pii_type: name}
+      - name: primary_email
+        meta: {contains_pii: true, pii_type: email}
+      - name: primary_phone_e164
+        meta: {contains_pii: true, pii_type: phone}
+      - name: source_record_count
+        description: Number of source records merged into this owner (>1 means duplicates were resolved).
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+      - name: distinct_email_count
+        description: ">1 flags owners with several emails (legitimate, or an over-merge worth reviewing)."
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                max_value: 3
+              config:
+                severity: warn
+
+  - name: int_boats
+    description: One row per physical boat keyed on the standardised hull identifier.
+    columns:
+      - name: boat_id
+        description: Boat surrogate key = hash(hull_id).
+        data_tests: [not_null, unique]
+      - name: hull_id
+        description: Standardised hull identifier (natural key).
+        data_tests: [not_null, unique]
+      - name: current_owner_id
+        description: Owner on the most recent booking.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('int_owners')
+                field: owner_id
+      - name: has_conflicting_boat_names
+        description: True if the boat appears under genuinely different names (not just spacing/case variants).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [false]
+              config:
+                severity: warn
+      - name: has_ownership_change
+        description: True if bookings for this hull resolve to more than one owner (resale or missed match).
+
+unit_tests:
+  - name: ut_int_owner_identity_map_resolution_rules
+    description: >
+      (1) 'John Doe' (phone) + 'J. Doe' (email) merge through the shared hull + surname + initial, and the Stripe sub
+      joins by email (transitive). (2) A boat resold to 'Mark Smith' does NOT merge with the seller. (3) Phone links
+      two bookings, and email chains in a Stripe sub. (4) A placeholder email shared by more records than the threshold
+      is ignored. (5) A Stripe-only customer becomes its own owner.
+    model: int_owner_identity_map
+    overrides:
+      vars:
+        identity_max_records_per_key: 2
+    given:
+      - input: ref('stg_marina_pms')
+        rows:
+          - {booking_id: P1, customer_full_name: "John Doe",   contact_email: null,              contact_phone_e164: "+15550192834", hull_id: H1}
+          - {booking_id: P2, customer_full_name: "J. Doe",     contact_email: "jd@x.com",        contact_phone_e164: null,           hull_id: H1}
+          - {booking_id: P3, customer_full_name: "Mark Smith", contact_email: "ms@x.com",        contact_phone_e164: null,           hull_id: H1}
+          - {booking_id: P4, customer_full_name: "Amy Lee",    contact_email: null,              contact_phone_e164: "+15550000001", hull_id: H2}
+          - {booking_id: P5, customer_full_name: "Amy Lee",    contact_email: "amy@x.com",       contact_phone_e164: "+15550000001", hull_id: H3}
+          - {booking_id: P6, customer_full_name: "Ann One",    contact_email: "none@marina.com", contact_phone_e164: null,           hull_id: H6}
+          - {booking_id: P7, customer_full_name: "Bob Two",    contact_email: "none@marina.com", contact_phone_e164: null,           hull_id: H7}
+          - {booking_id: P8, customer_full_name: "Cy Three",   contact_email: "none@marina.com", contact_phone_e164: null,           hull_id: H8}
+      - input: ref('stg_stripe_subscriptions')
+        rows:
+          - {subscription_event_id: e1, subscription_id: S1, customer_email: "jd@x.com",   event_at_utc: "2026-01-01 00:00:00"}
+          - {subscription_event_id: e2, subscription_id: S2, customer_email: "amy@x.com",  event_at_utc: "2026-01-01 00:00:00"}
+          - {subscription_event_id: e3, subscription_id: S3, customer_email: "solo@x.com", event_at_utc: "2026-01-01 00:00:00"}
+    expect:
+      rows:
+        - {record_key: "marina_pms:P1", anchor_record_key: "marina_pms:P1", matched_on: "boat_and_name"}
+        - {record_key: "marina_pms:P2", anchor_record_key: "marina_pms:P1", matched_on: "boat_and_name,email"}
+        - {record_key: "stripe:S1",     anchor_record_key: "marina_pms:P1", matched_on: "email"}
+        - {record_key: "marina_pms:P3", anchor_record_key: "marina_pms:P3", matched_on: "unmatched"}
+        - {record_key: "marina_pms:P4", anchor_record_key: "marina_pms:P4", matched_on: "phone"}
+        - {record_key: "marina_pms:P5", anchor_record_key: "marina_pms:P4", matched_on: "email,phone"}
+        - {record_key: "stripe:S2",     anchor_record_key: "marina_pms:P4", matched_on: "email"}
+        - {record_key: "marina_pms:P6", anchor_record_key: "marina_pms:P6", matched_on: "unmatched"}
+        - {record_key: "marina_pms:P7", anchor_record_key: "marina_pms:P7", matched_on: "unmatched"}
+        - {record_key: "marina_pms:P8", anchor_record_key: "marina_pms:P8", matched_on: "unmatched"}
+        - {record_key: "stripe:S3",     anchor_record_key: "stripe:S3",     matched_on: "unmatched"}

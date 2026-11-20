@@ -1,0 +1,8 @@
+# Repo-local profile: dbt reads ./profiles.yml before ~/.dbt/profiles.yml, so no global setup is needed.
+marina_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('DUCKDB_PATH', 'marina.duckdb') }}"
+      threads: 4

@@ -1,0 +1,75 @@
+version: 2
+
+sources:
+  - name: stripe
+    description: >
+      Stripe subscription lifecycle events (memberships, plan changes, churn). Timestamps are UTC (Stripe API epochs).
+      Lands in the `raw` schema (all VARCHAR); locally loaded from data/raw by the load_local_raw_sources hook.
+    schema: raw
+    meta:
+      owner: finance
+      local_csv_dir: data/raw
+    tables:
+      - name: raw_stripe_subscriptions
+        description: One row per subscription event.
+        config:
+          # Freshness SLA. Production would use the EL sync column (e.g. _fivetran_synced) rather than a business timestamp.
+          loaded_at_field: "cast(event_timestamp as timestamp)"
+          freshness:
+            warn_after: {count: 2, period: day}
+        data_tests:
+          - expected_columns:
+              arguments:
+                column_names: [sub_id, customer_email, plan_name, mrr_amount, event_type, event_timestamp]
+          - dbt_utils.unique_combination_of_columns:
+              arguments:
+                combination_of_columns: [sub_id, event_type, event_timestamp]
+        columns:
+          - name: sub_id
+            data_tests: [not_null]
+          - name: customer_email
+            meta: {contains_pii: true, pii_type: email}
+
+models:
+  - name: stg_stripe_subscriptions
+    description: Typed, canonicalised Stripe subscription events (append-only event log).
+    columns:
+      - name: subscription_event_id
+        description: Surrogate key over (subscription_id, event_type, event_at_utc).
+        data_tests: [not_null, unique]
+      - name: subscription_id
+        data_tests: [not_null]
+      - name: customer_email
+        description: Lower-cased billing email; the join key to PMS identities.
+        meta: {contains_pii: true, pii_type: email}
+        data_tests:
+          - not_null:
+              config:
+                severity: warn   # a subscription without email becomes a billing-only owner; not fatal
+      - name: plan_name
+        data_tests: [not_null]
+      - name: billing_interval
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [annual, monthly]
+              config:
+                severity: warn
+      - name: mrr_amount_usd
+        description: Monthly recurring revenue for the subscription after this event, DECIMAL(10,2).
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+      - name: event_type
+        description: >
+          Lifecycle event. ERROR severity on unknown values on purpose: an unrecognised event could
+          misstate MRR, so the financial KPIs must not publish until it is mapped.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [new, renewal, upgrade, downgrade, reactivation, churn]
+      - name: event_at_utc
+        data_tests: [not_null]

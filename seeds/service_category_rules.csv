@@ -1,0 +1,5 @@
+rule_priority,match_pattern,service_category,rule_note
+10,\b(electric\w*|elec|wiring|wire|battery|batteries|shore ?power|charger|lighting|nav lights?)\b,Electrical,Most specific domain: wins over generic engine/hull terms
+20,\b(engine\w*|motor\w*|mech\w*|outboard|inboard|overhaul|propulsion|impeller|oil change|diesel|transmission)\b,Engine Maintenance,mech = mechanical (e.g. mech_maint_101)
+30,\b(hull\w*|paint\w*|bottom|antifoul\w*|gel ?coat|fiberglass|wax\w*|blister\w*|barnacle\w*)\b,Hull Service,Hull cleaning/painting/repair
+40,\b(dock\w*|slip|berth\w*|moor\w*|haul ?out|launch|storage)\b,Dockage,Slip/berth/haul-out services

@@ -1,0 +1,27 @@
+version: 2
+
+seeds:
+  - name: service_category_rules
+    description: >
+      Analyst-owned classification rules for free-text vendor service types. Each rule is a case-insensitive RE2
+      regex evaluated against the normalised service string (lower-case tokens separated by spaces).
+      The lowest rule_priority that matches wins (more specific domains get lower numbers). Adding coverage for a
+      new vendor phrasing is a CSV change reviewed in a PR, not a SQL change.
+    config:
+      column_types:
+        rule_priority: integer
+        match_pattern: varchar
+        service_category: varchar
+        rule_note: varchar
+    columns:
+      - name: rule_priority
+        data_tests: [not_null, unique]
+      - name: match_pattern
+        data_tests: [not_null, unique]
+      - name: service_category
+        description: Target taxonomy (closed set defined by the business).
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [Engine Maintenance, Hull Service, Dockage, Electrical]

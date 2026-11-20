@@ -1,0 +1,138 @@
+version: 2
+
+sources:
+  - name: vendor_ops
+    description: >
+      Third-party vendor / captain work-order logs (free-text service types, naive timestamps).
+      Lands in the `raw` schema (all VARCHAR); locally loaded from data/raw by the load_local_raw_sources hook.
+    schema: raw
+    meta:
+      owner: vendor-operations
+      local_csv_dir: data/raw
+    tables:
+      - name: raw_vendor_work_orders
+        description: One row per work order, current state (no change history / updated_at is provided).
+        config:
+          # Freshness SLA. Production would use the EL sync column (e.g. _fivetran_synced) rather than a business timestamp.
+          loaded_at_field: "cast(created_at as timestamp)"
+          freshness:
+            warn_after: {count: 2, period: day}
+        data_tests:
+          - expected_columns:
+              arguments:
+                column_names: [work_order_id, vendor_name, raw_service_type, hours_spent, status, created_at, completed_at]
+        columns:
+          - name: work_order_id
+            data_tests: [not_null, unique]
+
+models:
+  - name: stg_vendor_orders
+    description: >
+      Cleaned work orders: decimals, UTC timestamps, normalised status, vendor surrogate key and the
+      standardised service_category (Engine Maintenance / Hull Service / Dockage / Electrical).
+    data_tests:
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "status <> 'completed' or completed_at_utc is not null"
+          config:
+            description: A completed work order must have a completion timestamp.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "completed_at_utc is null or completed_at_utc >= created_at_utc"
+          config:
+            description: Completion cannot precede creation (would produce negative turnaround).
+    columns:
+      - name: work_order_id
+        description: Work order identifier (primary key).
+        data_tests: [not_null, unique]
+      - name: vendor_id
+        description: Surrogate key of the normalised vendor name (legal suffixes / 'Capt.' variants collapsed).
+        data_tests: [not_null]
+      - name: vendor_name
+        description: Vendor / captain name as submitted.
+      - name: vendor_type
+        description: "'captain' for individual captains (name starts with Capt./Captain), else 'vendor'."
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [captain, vendor]
+      - name: service_type_raw
+        description: Free-text service type exactly as submitted (kept for audit / rule tuning).
+      - name: service_category
+        description: Standardised category; 'Unclassified' when no rule matches (triggers a warning to extend the seed).
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [Engine Maintenance, Hull Service, Dockage, Electrical]
+              config:
+                severity: warn
+      - name: is_emergency
+        description: True when the service text signals urgency (emergency / urgent / asap).
+        data_tests: [not_null]
+      - name: hours_spent
+        description: Hours logged by the vendor, DECIMAL(10,2).
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 336   # > 2 weeks on one work order is almost certainly a data-entry error
+      - name: status
+        description: Normalised status (snake_case).
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [open, in_progress, completed, cancelled]
+      - name: created_at_utc
+        description: Work order creation time in UTC (source timezone from var vendor_source_timezone).
+        data_tests: [not_null]
+      - name: completed_at_utc
+        description: Completion time in UTC; NULL while the job is open.
+
+unit_tests:
+  - name: ut_stg_vendor_orders_service_classification
+    description: >
+      Regex rules map messy free text to the 4-category taxonomy; priority resolves conflicts
+      ('engine wiring' -> Electrical); unseen phrasing falls back to 'Unclassified'.
+    model: stg_vendor_orders
+    given:
+      - input: ref('service_category_rules')   # no rows given -> dbt uses the real seed CSV
+      - input: source('vendor_ops', 'raw_vendor_work_orders')
+        rows:
+          - {work_order_id: W1, vendor_name: "Marine Tech LLC", raw_service_type: "Engine_Overhaul_Emergency", hours_spent: "6.5", status: "Completed", created_at: "2026-03-01 09:00:00", completed_at: "2026-03-01 15:30:00"}
+          - {work_order_id: W2, vendor_name: "Capt. Bob", raw_service_type: "Hull Cleaning & Paint", hours_spent: "3.0", status: "Completed", created_at: "2026-03-02 10:00:00", completed_at: "2026-03-02 13:00:00"}
+          - {work_order_id: W3, vendor_name: "FastDock Inc", raw_service_type: "mech_maint_101", hours_spent: "4.0", status: "In Progress", created_at: "2026-03-03 08:00:00", completed_at: "NULL"}
+          - {work_order_id: W4, vendor_name: "Sparky's Marine Electric", raw_service_type: "ENGINE wiring fault", hours_spent: "1", status: " COMPLETED ", created_at: "2026-03-04 08:00:00", completed_at: "2026-03-04 09:00:00"}
+          - {work_order_id: W5, vendor_name: "Captain Bob", raw_service_type: "winter dock-line check", hours_spent: "0.5", status: "open", created_at: "2026-03-05 08:00:00", completed_at: ""}
+          - {work_order_id: W6, vendor_name: "Teak Pros", raw_service_type: "Teak refinishing", hours_spent: "2", status: "open", created_at: "2026-03-06 08:00:00", completed_at: null}
+    expect:
+      rows:
+        - {work_order_id: W1, vendor_type: vendor,  service_category: Engine Maintenance, is_emergency: true,  status: completed,   hours_spent: 6.50}
+        - {work_order_id: W2, vendor_type: captain, service_category: Hull Service,       is_emergency: false, status: completed,   hours_spent: 3.00}
+        - {work_order_id: W3, vendor_type: vendor,  service_category: Engine Maintenance, is_emergency: false, status: in_progress, hours_spent: 4.00}
+        - {work_order_id: W4, vendor_type: vendor,  service_category: Electrical,         is_emergency: false, status: completed,   hours_spent: 1.00}
+        - {work_order_id: W5, vendor_type: captain, service_category: Dockage,            is_emergency: false, status: open,        hours_spent: 0.50}
+        - {work_order_id: W6, vendor_type: vendor,  service_category: Unclassified,       is_emergency: false, status: open,        hours_spent: 2.00}
+
+  - name: ut_stg_vendor_orders_timestamps_to_utc_across_dst
+    description: >
+      Naive local timestamps are converted with the configured IANA zone (DST-aware); explicit offsets are honoured;
+      'NULL' text becomes NULL. W1 spans the 2026-03-08 US DST switch: 5 real hours, although the wall clock shows 6.
+    model: stg_vendor_orders
+    overrides:
+      vars:
+        vendor_source_timezone: America/New_York
+    given:
+      - input: ref('service_category_rules')
+      - input: source('vendor_ops', 'raw_vendor_work_orders')
+        rows:
+          - {work_order_id: W1, vendor_name: "A", raw_service_type: "engine", hours_spent: "5", status: "Completed", created_at: "2026-03-07 23:00:00", completed_at: "2026-03-08 05:00:00"}
+          - {work_order_id: W2, vendor_name: "B", raw_service_type: "hull", hours_spent: "1", status: "Completed", created_at: "2026-03-01T09:00:00Z", completed_at: "2026-03-01T12:00:00-05:00"}
+          - {work_order_id: W3, vendor_name: "C", raw_service_type: "hull", hours_spent: "1", status: "In Progress", created_at: "2026-07-01 12:00:00", completed_at: "NULL"}
+    expect:
+      rows:
+        - {work_order_id: W1, created_at_utc: "2026-03-08 04:00:00", completed_at_utc: "2026-03-08 09:00:00"}
+        - {work_order_id: W2, created_at_utc: "2026-03-01 09:00:00", completed_at_utc: "2026-03-01 17:00:00"}
+        - {work_order_id: W3, created_at_utc: "2026-07-01 16:00:00", completed_at_utc: null}
